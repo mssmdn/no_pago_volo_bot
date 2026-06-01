@@ -20,7 +20,7 @@ from db import (
 )
 from validators import validate_iata, validate_date, validate_return_date
 from checker import run_price_checks
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_INTERVAL_HOURS
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, CHECK_TIMES, CHECK_TIMEZONE
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,11 @@ def _fmt_duration(minutes: int | None) -> str:
         return "N/D"
     h, m = divmod(minutes, 60)
     return f"{h}h {m:02d}m"
+
+
+def _fmt_check_times() -> str:
+    """Formatta gli orari di check configurati per i messaggi Telegram. Es: '09:00, 13:00, 21:00'"""
+    return ", ".join(f"{int(h.strip()):02d}:00" for h in CHECK_TIMES.split(","))
 
 
 def _stops_keyboard() -> InlineKeyboardMarkup:
@@ -75,7 +80,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /check — Forza un controllo immediato dei prezzi\n"
         "• /history `ID` — Storico prezzi per tutti i voli di una rotta\n"
         "• /cancel — Annulla l'operazione in corso\n\n"
-        f"_Il bot controlla automaticamente ogni {CHECK_INTERVAL_HOURS} ore._",
+        f"_Il bot controlla automaticamente alle {_fmt_check_times()} ({CHECK_TIMEZONE})._",
         parse_mode="Markdown",
     )
 
@@ -243,7 +248,7 @@ async def step_max_stops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"📅  {date_info}\n"
         f"🔀  Scali: {stops_label[query.data]}\n\n"
         f"Il bot monitorerà i *3 voli più economici* per questa rotta.\n"
-        f"Il primo check partirà entro {CHECK_INTERVAL_HOURS} ore.",
+        f"_Prossimi check automatici: {_fmt_check_times()} ({CHECK_TIMEZONE})_",
         parse_mode="Markdown",
     )
     logger.info(
@@ -255,7 +260,6 @@ async def step_max_stops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Fallback del ConversationHandler: annulla /add in corso."""
     if not authorized(update):
         return ConversationHandler.END
     context.user_data.clear()
@@ -327,7 +331,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(
                     f"  {i}. ✈️ {airline_str} — {price_info} | ⏱️ {duration_str}"
                 )
-            lines.append("")  # riga vuota tra le rotte
+            lines.append("")
 
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
@@ -398,7 +402,8 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not monitored:
             await update.message.reply_text(
                 f"ℹ️ Nessun volo ancora monitorato per la rotta {route_id}.\n"
-                f"Il primo check partirà entro {CHECK_INTERVAL_HOURS} ore."
+                f"_Prossimi check automatici: {_fmt_check_times()} ({CHECK_TIMEZONE})_",
+                parse_mode="Markdown",
             )
             return
 
@@ -442,11 +447,10 @@ async def cmd_cancel_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Gestisce la risposta ai bottoni della notifica "nuovo volo più economico".
-
     Pattern callback_data:
         prop_rep:<id>  →  Sostituisci il volo più costoso con il nuovo
         prop_add:<id>  →  Aggiungi il nuovo senza rimuovere nulla
-        prop_ign:<id>  →  Ignora, non fare nulla
+        prop_ign:<id>  →  Ignora
     """
     query = update.callback_query
     await query.answer()
@@ -456,16 +460,12 @@ async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT
         return
 
     parts = query.data.split(":")
-    if len(parts) != 2:
+    if len(parts) != 2 or not parts[1].isdigit():
         await query.edit_message_text("⚠️ Dati di callback non validi.")
         return
 
-    action, raw_id = parts
-    if not raw_id.isdigit():
-        await query.edit_message_text("⚠️ Dati di callback non validi.")
-        return
-
-    proposal_id = int(raw_id)
+    action      = parts[0]
+    proposal_id = int(parts[1])
 
     with get_session() as session:
         proposal = (
@@ -486,16 +486,13 @@ async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT
         new_price    = proposal.price
         new_currency = proposal.currency
 
-        # ── Sostituisci ────────────────────────────────────────────────────
         if action == "prop_rep":
             old_mf      = session.query(MonitoredFlight).filter(
                 MonitoredFlight.id == proposal.replace_flight_id
             ).first()
             old_airline = old_mf.airline if old_mf else "Sconosciuta"
-
             if old_mf:
                 old_mf.is_active = False
-
             session.add(MonitoredFlight(
                 route_id=proposal.route_id,
                 airline=proposal.airline,
@@ -507,7 +504,6 @@ async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT
             ))
             proposal.resolved = True
             session.commit()
-
             await query.edit_message_text(
                 f"✅ *Volo aggiornato*\n\n"
                 f"♻️ _{old_airline}_ rimosso dal monitoraggio.\n"
@@ -519,7 +515,6 @@ async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT
                 f"(rotta {proposal.route_id})"
             )
 
-        # ── Aggiungi ───────────────────────────────────────────────────────
         elif action == "prop_add":
             session.add(MonitoredFlight(
                 route_id=proposal.route_id,
@@ -532,7 +527,6 @@ async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT
             ))
             proposal.resolved = True
             session.commit()
-
             await query.edit_message_text(
                 f"✅ *Volo aggiunto*\n\n"
                 f"➕ *{new_airline}* ({new_currency}{new_price:.0f}) "
@@ -546,14 +540,11 @@ async def handle_proposal_callback(update: Update, context: ContextTypes.DEFAULT
                 f"(rotta {proposal.route_id})"
             )
 
-        # ── Ignora ─────────────────────────────────────────────────────────
         else:  # prop_ign
             proposal.resolved = True
             session.commit()
-
             await query.edit_message_text(
-                f"❌ Proposta ignorata.\n"
-                f"_{new_airline}_ non aggiunto al monitoraggio."
+                f"❌ Proposta ignorata.\n_{new_airline}_ non aggiunto al monitoraggio."
             )
             logger.info(f"Proposta {proposal_id}: ignorata (rotta {proposal.route_id})")
 
@@ -573,7 +564,7 @@ def _count_monitored(session, route_id: int) -> int:
 # ── Application builder ────────────────────────────────────────────────────────
 
 async def _post_init(app: Application) -> None:
-    """Popola il menu comandi Telegram (la tendina che appare digitando /)."""
+    """Popola il menu comandi Telegram."""
     await app.bot.set_my_commands([
         BotCommand("start",   "Mostra i comandi disponibili"),
         BotCommand("add",     "Aggiungi una nuova rotta (guidato)"),
@@ -615,9 +606,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("check",   cmd_check))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("cancel",  cmd_cancel_global))
-
-    # Deve stare dopo conv_add: il pattern specifico ^prop_ evita
-    # qualsiasi conflitto con i callback interni alla conversazione.
     app.add_handler(CallbackQueryHandler(
         handle_proposal_callback,
         pattern=r"^prop_(rep|add|ign):\d+$",
