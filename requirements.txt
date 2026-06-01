@@ -1,6 +1,6 @@
 python-telegram-bot==22.7
-APScheduler==3.11.1
-SQLAlchemy==2.0.36
-aiohttp==3.13.4
+APScheduler==3.11.2
+SQLAlchemy==2.0.50
+aiohttp==3.13.5
 python-dotenv==1.2.2
 psycopg2-binary==2.9.12
