@@ -3,3 +3,4 @@ APScheduler==3.11.1
 SQLAlchemy==2.0.36
 aiohttp==3.13.4
 python-dotenv==1.2.2
+psycopg2-binary==2.9.12
